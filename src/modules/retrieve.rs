@@ -1,4 +1,5 @@
-use std::{cmp::Reverse, collections::HashMap};
+use std::collections::HashMap;
+use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
 use futures::stream::TryStreamExt;
@@ -20,7 +21,7 @@ use super::storage::LibraryDatabase;
 pub async fn recently_added_albums(
     spotify: &AuthCodeSpotify,
     library: &LibraryDatabase,
-    max_songs: Option<u32>,
+    max_songs: Option<usize>,
 ) -> Vec<SavedAlbum> {
     let stream = spotify.current_user_saved_albums(None);
 
@@ -34,8 +35,12 @@ pub async fn recently_added_albums(
     while let Some(item) = stream.try_next().await.unwrap() {
         let id = item.album.id.id();
         let name = item.album.name.clone();
+        if !current_albums.contains_key(id) {
+            println!("New album: {}", name);
+        }
+
         if num_songs < max_songs.unwrap_or(0) || !current_albums.contains_key(id) {
-            num_songs += item.album.tracks.total;
+            num_songs += usize::try_from(item.album.tracks.total).unwrap();
             recent_albums.push(item);
         } else {
             break;
@@ -43,9 +48,6 @@ pub async fn recently_added_albums(
         names.push(name);
     }
 
-    for album in &recent_albums {
-        println!("Album: {:?}", album.album.name);
-    }
     // Storage function
     recent_albums
 }
@@ -67,58 +69,40 @@ pub async fn playlist_items(
     tracks
 }
 
-// This function could probs be split up
-// This needs to be refactored
 pub async fn recently_added_tracks(
     spotify: &AuthCodeSpotify,
     library: &LibraryDatabase,
-    max_songs: Option<u32>,
+    max_songs: Option<usize>,
 ) -> Vec<SavedTrack> {
     let recent_albums = recently_added_albums(spotify, library, max_songs).await;
-    let recent_album_tracks = conversion::albums_to_tracks(
-        spotify,
-        recent_albums
-            .iter()
-            .map(|album| album.album.clone())
-            .collect_vec(),
-    )
-    .await;
+    let mut recent_album_tracks =
+        conversion::saved_albums_to_saved_tracks(spotify, recent_albums).await;
+    let latest_track = recent_album_tracks
+        .iter()
+        .min_by_key(|saved_track| saved_track.added_at);
 
-    let mut album_to_time = HashMap::new();
-    for album in recent_albums {
-        album_to_time.insert(album.album.id.id().to_owned(), album.added_at);
-    }
+    let latest_time = match latest_track {
+        Some(track) => Some(&track.added_at),
+        None => None,
+    };
 
-    let liked_tracks = recently_liked_tracks(spotify, library, album_to_time.values().min()).await;
+    let liked_tracks = recently_liked_tracks(spotify, library, latest_time).await;
 
-    let mut recent_album_tracks = recent_album_tracks
-        .into_iter()
-        .map(|track| SavedTrack {
-            track: track.clone(),
-            added_at: album_to_time
-                .get(track.album.id.unwrap().id())
-                .unwrap()
-                .to_owned(),
-        })
-        .collect_vec();
-
-    recent_album_tracks = arrange_recent_tracks(recent_album_tracks);
-    // for track in &recent_album_tracks {
-    // println!("Track: {:?}", track.track.name);
-    // }
     let full_track_list = recent_album_tracks
         .iter()
         .map(|track| track.track.clone())
         .collect_vec();
-    for track in liked_tracks {
-        if !full_track_list.contains(&track.track) {
-            recent_album_tracks.push(track.clone());
+    for liked_track in liked_tracks {
+        if !full_track_list.contains(&liked_track.track) {
+            recent_album_tracks.push(liked_track.clone());
         }
     }
-    recent_album_tracks.sort_by_key(|saved_track| Reverse(saved_track.added_at));
+
+    recent_album_tracks = arrange_recent_tracks(recent_album_tracks);
     recent_album_tracks
 }
 
+// Same with this function I should refactor this
 fn arrange_recent_tracks(tracks: Vec<SavedTrack>) -> Vec<SavedTrack> {
     let mut tracks = tracks;
     tracks.sort_by_key(|saved_track| saved_track.added_at);
@@ -149,6 +133,7 @@ fn arrange_recent_tracks(tracks: Vec<SavedTrack>) -> Vec<SavedTrack> {
     let mut sorted_tracks = Vec::new();
     for album in albums_from_tracks {
         let tracks = albums_to_tracks.get_mut(&album).unwrap();
+        tracks.sort_by_key(|track| track.track.track_number);
         sorted_tracks.append(tracks.as_mut());
     }
 
@@ -163,7 +148,7 @@ pub async fn recently_liked_tracks(
     let stream = spotify.current_user_saved_tracks(None);
     pin_mut!(stream);
 
-    let current_tracks = library.retrieve_tracks();
+    let current_tracks = library.retrieve_liked();
     let mut liked_tracks = Vec::new();
     while let Some(item) = stream.try_next().await.unwrap() {
         if item.track.is_local {

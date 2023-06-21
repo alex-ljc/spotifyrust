@@ -11,109 +11,229 @@
 //!
 //! *Note*: refresh tokens can actually expire, [as the OAuth2 spec
 //! indicates](https://tools.ietf.org/html/rfc6749#section-6), but this [hasn't
-//! actually happened in months with some
+//! actually happened in months with som
 //! tokens](https://github.com/felix-hilden/tekore/issues/86), so in the case of
 //! Spotify it doesn't seem to revoke them at all.
 
-use std::env;
-
-use itertools::Itertools;
-use rspotify::model::playlist;
-use rspotify::model::PlaylistId;
+use clap::arg;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
+use modules::playlists::clear_playlist;
 use rspotify::prelude::*;
 
 pub mod modules;
-use crate::modules::playlists::add_tracks_to_playlist;
+use crate::modules::playlists::add_searched_tracks;
 use crate::modules::playlists::update_everything;
 use crate::modules::playlists::update_liked;
 use crate::modules::playlists::update_recently_added;
 use crate::modules::playlists::update_weekly_sample;
-use crate::modules::playlists::clear_playlist;
 use crate::modules::retrieve::print_album;
 use crate::modules::retrieve::print_artist;
 use crate::modules::retrieve::print_track;
 use crate::modules::storage::LibraryDatabase;
-use crate::modules::{storage, token};
+use crate::modules::token;
 
 pub static RECENTLY_ADDED: &str = "3BZP1mB69SWnSNCy4nfxXX";
 pub static QUEUE_OF_SHIT: &str = "7kSoTKPlSLr0BKkFfOLhY2";
 pub static RANDOMIZED_EVERYTHING: &str = "40DOSUlAs5lSqRqZ0KKS9R";
 pub static WEEKLY_SAMPLE: &str = "6qYfQbHqlspyN18nF7bZB8";
 pub static LIKED: &str = "1Eb6PKpnm0iz68zmNkT5rY";
-pub static FILTER: &str = "46nfCqV4983BKRXFDEiMQ4";
+pub static SEARCH: &str = "46nfCqV4983BKRXFDEiMQ4";
+pub static TEST: &str = "5Zr1P0Q9xjrZnY1Ud5Aj1P";
+
+/// Spotify Playlist Manager
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct CLI {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum IdType {
+    Artist,
+    Album,
+    Track,
+}
+
+#[derive(Subcommand, Clone)]
+enum Commands {
+    /// Updates a playlist with the given info
+    Update {
+        /// Which playlist to update and how
+        #[command(subcommand)]
+        update_command: UpdateCommands,
+    },
+
+    /// Given a type and id prints the data from spotify
+    Print {
+        /// Id to print
+        #[arg(short, long)]
+        print_id: String,
+
+        /// Type of id
+        #[arg(short, long)]
+        id_type: IdType,
+    },
+
+    /// Queries the database with the given string and adds the songs to a preset playlist
+    Search {
+        /// String to search
+        #[arg(short, long)]
+        query: String,
+
+        /// Playlist ID
+        #[arg(short, long, default_value_t = SEARCH.to_string())]
+        playlist: String,
+
+        /// Print
+        #[arg(short, long, default_value_t = false)]
+        do_print: bool,
+    },
+
+    /// Removes all songs in a playlist
+    Clear {
+        /// Playlist ID
+        #[arg(short, long)]
+        playlist: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum UpdateCommands {
+    /// Adds all new songs to the database
+    Database,
+
+    /// Updates a given playlist with recently liked songs and recently liked albums
+    RecentlyAdded {
+        /// Playlist ID
+        #[arg(short, long, default_value = RECENTLY_ADDED)]
+        playlist: String,
+
+        /// Number of new songs
+        #[arg(short, long, default_value_t = 1000)]
+        num_new_songs: usize,
+
+        /// Removes all songs in playlist
+        #[arg(short, long, default_value_t = false)]
+        reset_playlist: bool,
+    },
+
+    /// Updates a given playlist with a sample of recent and old songs from the database
+    Everything {
+        /// Playlist ID
+        #[arg(short, long, default_value = RANDOMIZED_EVERYTHING)]
+        playlist: String,
+
+        /// Number of new songs
+        #[arg(short, long, default_value_t = 200)]
+        num_new_songs: usize,
+
+        /// Number of old songs
+        #[arg(short, long, default_value_t = 1800)]
+        num_old_songs: usize,
+    },
+
+    /// Updates a given playlist with a random sample of songs
+    WeeklySample {
+        /// Playlist ID
+        #[arg(short, long, default_value = WEEKLY_SAMPLE)]
+        playlist: String,
+
+        /// Number of songs
+        #[arg(short, long, default_value_t = 200)]
+        num_songs: usize,
+
+        /// Removes all songs in playlist
+        #[arg(short, long, default_value_t = false)]
+        reset_playlist: bool,
+    },
+
+    /// Updates a given playlist
+    Liked {
+        /// Playlist ID
+        #[arg(short, long, default_value = LIKED)]
+        playlist: String,
+
+        /// Removes all songs in playlist
+        #[arg(short, long, default_value_t = false)]
+        reset_playlist: bool,
+    },
+}
 
 #[tokio::main]
+
 async fn main() {
     // You can use any logger for debugging.
     env_logger::init();
+    let rspot_dir = std::env::var("rspot_dir").unwrap_or_else(|_| {
+        println!("Enter the rspot_dir");
+        let mut rspotify_config_dir = String::new();
+        std::io::stdin()
+            .read_line(&mut rspotify_config_dir)
+            .expect("Failed to read line");
+        std::env::set_var("rspot_dir", rspotify_config_dir.trim());
+        rspotify_config_dir.trim().to_string()
+    });
+    let rspot_dir = std::path::PathBuf::from(rspot_dir);
 
-    let spotify = token::default_authcode().await.unwrap();
+    let spotify = token::default_authcode(&rspot_dir).await.unwrap();
     spotify
         .refresh_token()
         .await
         .expect("couldn't refresh user token");
 
-    let library = storage::LibraryDatabase::new("albums.json".to_owned(), "tracks.json".to_owned());
+    let library = LibraryDatabase::new(
+        rspot_dir.join("albums.json").to_str().unwrap().to_string(),
+        rspot_dir.join("tracks.json").to_str().unwrap().to_string(),
+        rspot_dir.join("liked.json").to_str().unwrap().to_string(),
+    );
 
-    let args: Vec<String> = env::args().collect();
+    let cli = CLI::parse();
 
-    println!("{:?}", args);
-
-    if args.len() == 2 {
-        if args[1].eq("update") {
-            library.update_all(&spotify).await;
-        } else if args[1].eq("genres") {
-            let genres = LibraryDatabase::compile_genres(
-                library.retrieve_albums().values().cloned().collect_vec(),
-            );
-            for (genre, tracks) in genres {
-                println!("{}: {}", genre, tracks.len());
+    match &cli.command {
+        Commands::Update { update_command } => match update_command {
+            UpdateCommands::Database => library.update_all(&spotify).await,
+            UpdateCommands::RecentlyAdded {
+                playlist,
+                num_new_songs,
+                reset_playlist,
+            } => update_recently_added(&spotify, &library, playlist, *num_new_songs).await,
+            UpdateCommands::Everything {
+                playlist,
+                num_new_songs,
+                num_old_songs,
+            } => {
+                update_everything(&spotify, &library, playlist, *num_new_songs, *num_old_songs)
+                    .await
             }
-        }
-    }
-    if args[1].eq("update") {
-        if args[2].eq("database") {
-            library.update_all(&spotify).await;
-        } else if args[2].eq("recently_added") {
-            update_recently_added(&spotify, &library, RECENTLY_ADDED, 1000).await;
-        } else if args[2].eq("everything") {
-            update_everything(&spotify, &library, RANDOMIZED_EVERYTHING, 300, 1500).await;
-            library.update_all(&spotify).await;
-        } else if args[2].eq("weekly_sample") {
-            update_weekly_sample(&spotify, &library, WEEKLY_SAMPLE, 200).await;
-        } else if args[2].eq("liked") {
-            update_liked(&spotify, &library, LIKED).await;
-        }
-    }
+            UpdateCommands::WeeklySample {
+                playlist,
+                num_songs,
+                reset_playlist,
+            } => update_weekly_sample(&spotify, &library, playlist, *num_songs).await,
+            UpdateCommands::Liked {
+                playlist,
+                reset_playlist,
+            } => update_liked(&spotify, &library, playlist).await,
+        },
 
-    if args.len() == 3 && args[1].eq("search") {
-        let query = &args[2];
-        let track_ids = library.search_songs(query);
-        let stored_tracks = library.retrieve_tracks();
-        let mut filtered_tracks = Vec::new();
-        for track in track_ids {
-            filtered_tracks.push(stored_tracks.get(&track).unwrap().clone());
+        Commands::Print { print_id, id_type } => match id_type {
+            IdType::Artist => print_artist(&spotify, print_id).await,
+            IdType::Album => print_album(&spotify, print_id).await,
+            IdType::Track => print_track(&spotify, print_id).await,
+        },
+        Commands::Search {
+            query,
+            playlist,
+            do_print,
+        } => {
+            add_searched_tracks(&spotify, &library, playlist, query, *do_print).await;
         }
-        let playlist_id = FILTER;
-        clear_playlist(&spotify, playlist_id).await;
-        add_tracks_to_playlist(&spotify, playlist_id, filtered_tracks).await;
-        let _ = spotify
-            .playlist_change_detail(
-                PlaylistId::from_id(playlist_id).unwrap(),
-                Some(query),
-                None,
-                None,
-                None,
-            )
-            .await;
-    }
-    if args.len() == 4 {
-        if args[1].eq("print") && args[2].eq("artist") {
-            print_artist(&spotify, &args[3]).await;
-        } else if args[1].eq("print") && args[2].eq("album") {
-            print_album(&spotify, &args[3]).await;
-        } else if args[1].eq("print") && args[2].eq("track") {
-            print_track(&spotify, &args[3]).await;
+        Commands::Clear { playlist } => {
+            clear_playlist(&spotify, playlist).await;
         }
     }
 }

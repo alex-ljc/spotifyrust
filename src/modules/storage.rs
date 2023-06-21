@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use itertools::Itertools;
 use rspotify::{
     model::{FullAlbum, FullTrack, TrackId},
@@ -15,13 +16,15 @@ use super::{
 pub struct LibraryDatabase {
     album_path: String,
     track_path: String,
+    liked_path: String,
 }
 
 impl LibraryDatabase {
-    pub fn new(album_path: String, track_path: String) -> LibraryDatabase {
+    pub fn new(album_path: String, track_path: String, liked_path: String) -> LibraryDatabase {
         Self {
             album_path,
             track_path,
+            liked_path,
         }
     }
 
@@ -68,12 +71,26 @@ impl LibraryDatabase {
         Self::store_hashmap(&current_albums, &self.album_path);
     }
 
+    fn update_liked(&self, tracks: Vec<FullTrack>) {
+        let mut current_tracks = self.retrieve_liked();
+        for track in tracks {
+            current_tracks.insert(track.id.clone().unwrap().id().to_string(), track);
+        }
+
+        Self::store_hashmap(&current_tracks, &self.liked_path);
+    }
+
     pub async fn update_all(&self, spotify: &AuthCodeSpotify) {
         self.update_tracks(saved_tracks_to_tracks(
             retrieve::recently_added_tracks(spotify, self, None).await,
         ));
         self.update_albums(saved_albums_to_albums(
             retrieve::recently_added_albums(spotify, self, None).await,
+        ));
+
+        self.update_liked(saved_tracks_to_tracks(
+            retrieve::recently_liked_tracks(spotify, self, Some(&Utc.timestamp_opt(0, 0).unwrap()))
+                .await,
         ));
     }
 
@@ -83,6 +100,10 @@ impl LibraryDatabase {
 
     pub fn retrieve_tracks(&self) -> HashMap<String, FullTrack> {
         Self::load_hashmap::<FullTrack>(&self.track_path)
+    }
+
+    pub fn retrieve_liked(&self) -> HashMap<String, FullTrack> {
+        Self::load_hashmap::<FullTrack>(&self.liked_path)
     }
 
     pub fn compile_genres(albums: Vec<FullAlbum>) -> HashMap<String, Vec<TrackId<'static>>> {

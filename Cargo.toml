@@ -16,6 +16,9 @@ futures-util = "0.3.28"
 serde = "1.0.159"
 json = "0.12.4"
 actix-rt = "2.8.0"
+
 serde_json = "1.0.96"
 itertools = "0.10.5"
 rand = "0.8.5"
+crate = "0.0.2"
+clap = { version = "4.3.3", features = ["derive"] }
